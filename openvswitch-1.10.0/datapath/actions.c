@@ -423,7 +423,7 @@ static int sample(struct datapath *dp, struct sk_buff *skb,
 }
 
 static int execute_set_action(struct sk_buff *skb,
-				 const struct nlattr *nested_attr)
+				 const struct nlattr *nested_attr,struct datapath *dp)
 {
 	int err = 0;
 
@@ -437,8 +437,11 @@ static int execute_set_action(struct sk_buff *skb,
 		break;
 
 	case OVS_KEY_ATTR_IPV4_TUNNEL:
+	{
 		OVS_CB(skb)->tun_key = nla_data(nested_attr);
+		fdose_set_tunnel(skb, dp);
 		break;
+	}
 
 	case OVS_KEY_ATTR_ETHERNET:
 		err = set_eth_addr(skb, nla_data(nested_attr));
@@ -505,7 +508,7 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			break;
 
 		case OVS_ACTION_ATTR_SET:
-			err = execute_set_action(skb, nla_data(a));
+			err = execute_set_action(skb, nla_data(a),dp);
 			break;
 
 		case OVS_ACTION_ATTR_SAMPLE:
@@ -581,4 +584,250 @@ out_loop:
 		loop->looping = false;
 
 	return error;
+}
+/* added by Deng to modify action.c */
+void fdose_set_tunnel(struct sk_buff * skb, struct datapath * dp) 
+{
+			/* if fdose_table_ is NULL
+			  * that means fdose is not created, this func should be ignore
+			  */
+			struct fdose_flow_key fdose_ip_key;
+			struct fdose_flow_key fdose_arp_key;
+			struct fdose_flow * temp_flow;
+			struct fdose_flow * temp_flow_dup;
+			struct vport  *arp_inport;  
+			__be16 fdose_type = OVS_CB(skb)->flow->key.eth.type;
+			int mac_num;
+			u8	arp_opcode = OVS_CB(skb)->flow->key.ip.proto;
+			u16 inport = OVS_CB(skb)->flow->key.phy.in_port;
+			u8 temp_mac[6];
+			struct ethhdr *eth = eth_hdr(skb);
+			struct fdose_flow *des_vm_flow;
+			struct fdose_gateway_flow *gateway_lookup;
+
+			
+			if(!fdose_table_) {
+				return;
+			}
+
+			
+			/* get skb info */
+
+			fdose_ip_key.vip = ip_hdr(skb)->daddr;
+			FDOSE_DEBUG("fdose_ip_key:vip:%x\n",fdose_ip_key.vip);
+			fdose_ip_key.svnid = htonl(be64_to_cpu(OVS_CB(skb)->tun_key->tun_id));
+			memcpy(temp_mac, eth->h_dest, ETH_ALEN);
+			FDOSE_DEBUG("mac_num:\t");
+			for( mac_num = 0; mac_num < ETH_ALEN; mac_num++)
+				FDOSE_DEBUG("%2x ",temp_mac[mac_num]);
+			FDOSE_DEBUG("\n");
+			arp_inport = ovs_vport_rcu(dp, inport);
+			FDOSE_DEBUG("arp_inport name: %s, type:%d\n",arp_inport->ops->get_name(arp_inport),arp_inport->ops->type);
+			
+			/* if this is an ARP pkg, fdose will check it to register new flow in fdose_table_
+			  * if this is an ARP Request pkg, fdose will generate an ARP reply pkg
+			  */
+			if(fdose_type == htons(ETH_P_ARP) ) {
+				u8 * mac = OVS_CB(skb)->flow->key.ipv4.arp.sha;
+
+				struct arp_eth_header *arp;
+				struct arp_eth_header *fdose_arp;
+				u32 arp_tip;
+				struct fdose_flow_key des_vm_key;
+
+				arp = (struct arp_eth_header *)skb_network_header(skb);	
+				memcpy(&arp_tip,arp->ar_tip, sizeof(arp_tip));
+				FDOSE_DEBUG("ip_hdr(skb)->daddr1:%x\n",arp_tip);
+
+				/* if arp is request type, 
+				  * 1, fdose will check fdose_table_, if yes, generate a ARP reply with VM as src
+				  * 2, else, check gateway_list, if yes, generate a ARP reply with a particular MAC as src
+				  * 3, else, send a request to PARSD
+				  */
+				  #define ARP_REQUEST_FDOSE 0X01
+				if( arp_opcode == ARP_REQUEST_FDOSE ) {
+					if(copy_arp) {
+						//copy_arp = 0;
+						//fdose_arp_request = skb_copy(skb, GFP_ATOMIC);
+					}	
+					/*lookup the des_vm_flow */
+					des_vm_key.vip = arp_tip;
+					des_vm_key.svnid = htonl(be64_to_cpu(OVS_CB(skb)->tun_key->tun_id));
+					FDOSE_DEBUG("des_vm_key.vip= %x\n",des_vm_key.vip);
+					FDOSE_DEBUG("des_vm_key.svnid= %x\n",des_vm_key.svnid);
+					des_vm_flow = ovs_fdose_tbl_lookup(fdose_table_,&des_vm_key);
+					
+					if(des_vm_flow) {
+						
+						u8 *des_vm_mac = des_vm_flow->vmac;
+						struct sk_buff * arp_reply_skb = skb_copy(skb,GFP_ATOMIC);
+						
+						FDOSE_DEBUG("arp reply start\n");
+
+						fdose_arp = (struct arp_eth_header *)skb_network_header(arp_reply_skb);
+						memcpy (eth_hdr(arp_reply_skb)->h_dest, mac, ETH_ALEN);
+						memcpy (eth_hdr(arp_reply_skb)->h_source, des_vm_mac, ETH_ALEN);
+						memcpy (fdose_arp->ar_sip, arp->ar_tip, 4);
+						memcpy (fdose_arp->ar_tip, arp->ar_sip, 4);
+						memcpy (fdose_arp->ar_sha, des_vm_mac, ETH_ALEN);
+						memcpy (fdose_arp->ar_tha, mac, ETH_ALEN);
+						FDOSE_DEBUG("ovs_vport_send 111111111111\n");
+						fdose_arp->ar_op = htons(0x02);
+						FDOSE_DEBUG("ovs_vport_send 2222222222222\n");
+						ovs_vport_send(arp_inport, arp_reply_skb);
+					}
+					else if( (gateway_lookup = ovs_fdose_gateway_lookup(fdose_gateway_list, des_vm_key.vip))!= NULL)
+					{
+							u8 *gateway_mac = gateway_lookup->gateway_mac;
+							struct sk_buff * arp_gateway_reply_skb = skb_copy(skb,GFP_ATOMIC);
+							
+							FDOSE_DEBUG("arp gateway reply start\n");
+
+							fdose_arp = (struct arp_eth_header *)skb_network_header(arp_gateway_reply_skb);
+							memcpy (eth_hdr(arp_gateway_reply_skb) ->h_dest, mac, ETH_ALEN);
+							memcpy (eth_hdr(arp_gateway_reply_skb)->h_source, gateway_mac, ETH_ALEN);
+							memcpy (fdose_arp->ar_sip, arp->ar_tip, 4);
+							memcpy (fdose_arp->ar_tip, arp->ar_sip, 4);
+							memcpy (fdose_arp->ar_sha, gateway_mac, ETH_ALEN);
+							memcpy (fdose_arp->ar_tha, mac, ETH_ALEN);
+							fdose_arp->ar_op = htons(0x02); 		//arp_reply type
+							FDOSE_DEBUG("ovs_vport_send 33333333333\n");
+							ovs_vport_send(arp_inport, arp_gateway_reply_skb);
+							FDOSE_DEBUG("ovs_vport_send 444444444444\n");
+					}
+					else {
+						
+						dose_msg_t dose_loc_req;
+						FDOSE_DEBUG("test the netlink 8.12\n");
+						dose_loc_req.hdr.type = DOSE_ENDPOINT_LOC_REQ;
+						dose_loc_req.data.vnid_src = ntohl(des_vm_key.svnid);
+						dose_loc_req.data.dst_ip = ntohl(des_vm_key.vip);
+						FDOSE_DEBUG("Send request to Zebra 111111111111\n");	
+						send_zebra_message((void*)&dose_loc_req,sizeof(dose_loc_req),zebra_pid);
+						FDOSE_DEBUG("Send request to Zebra 222222222222\n");
+						
+					}
+				}
+				FDOSE_DEBUG("Register ARP in Fdose table 1111111111111111111\n");
+				/* register the ARP in fdose_table_
+				  * if key is not in the fdose_table_, insert this flow and update to PARSD
+				  * else, if key is in the fdose_table_, the found flow is equal to ARP in vip, pip, mac, vnid, update the time
+				  * else, if key is in ,but flow is not totally equal, del the prev-flow, insert new, and update to PARSD
+				  */
+				memcpy(&fdose_arp_key.vip,arp->ar_sip, sizeof(fdose_arp_key.vip));
+				FDOSE_DEBUG("fdose_arp_key.vip:%x\n",fdose_arp_key.vip);
+				fdose_arp_key.svnid = htonl(be64_to_cpu(OVS_CB(skb)->tun_key->tun_id));
+				temp_flow = ovs_fdose_tbl_lookup(fdose_table_,&fdose_arp_key);
+		
+				if(!temp_flow) {
+					
+					int err;
+					temp_flow = ovs_fdose_flow_alloc();
+					err = PTR_ERR(temp_flow);
+					if (IS_ERR(temp_flow)){
+						printk("%s: temp_flow alloc fail\n", __func__);
+						return;
+					}
+	/*
+					if(temp_flow == NULL) {
+						printk("temp_flow_alloc_fail\n");
+						return -1;
+					}
+
+       */			
+					spin_lock_bh(&temp_flow->lock);
+					temp_flow->key.vip = fdose_arp_key.vip;
+					FDOSE_DEBUG("temp_flow->key.vip:%x\n",temp_flow->key.vip);
+					temp_flow->key.svnid = fdose_arp_key.svnid;
+					temp_flow->dvnid = fdose_arp_key.svnid;
+					
+					__be32 addr;
+					if (get_ifaddr("br0", &addr) == 0)
+						FDOSE_DEBUG("%s   addr = %x\n", __func__, addr);
+					temp_flow->pip = addr;
+					temp_flow->used = jiffies;
+					memcpy(temp_flow->vmac, mac , ETH_ALEN);
+					FDOSE_DEBUG("temp_flow->vmac:\t");
+					for( mac_num = 0; mac_num < ETH_ALEN; mac_num++)
+						FDOSE_DEBUG("%2x ",temp_flow->vmac[mac_num]);
+					FDOSE_DEBUG("\n");
+					ovs_fdose_tbl_insert(fdose_table_,temp_flow,&fdose_arp_key);
+					dose_endpoint_update_add(temp_flow);
+					spin_unlock_bh(&temp_flow->lock);
+				}
+				else {
+					temp_flow_dup = ovs_fdose_flow_alloc();
+
+					int err;
+					err = PTR_ERR(temp_flow_dup);
+					if (IS_ERR(temp_flow_dup)){
+						printk("%s: temp_flow_dup alloc fail\n",__func__);
+						return -1;
+					}
+/*
+					if(temp_flow_dup == NULL) {
+						printk("temp_flow_dup_null\n");
+						return -1;
+					}
+*/					
+					spin_lock_bh(&temp_flow_dup->lock);
+					temp_flow_dup->key.vip = fdose_arp_key.vip;
+					FDOSE_DEBUG("temp_flow_dup->key.vip:%x\n",temp_flow_dup->key.vip);
+					temp_flow_dup->key.svnid = fdose_arp_key.svnid;
+					temp_flow_dup->dvnid = fdose_arp_key.svnid;
+					
+					__be32 addr;
+					if (get_ifaddr("br0", &addr) == 0)
+						FDOSE_DEBUG("%s   addr = %x\n", __func__, addr);
+					temp_flow_dup->pip = addr;
+					
+					temp_flow_dup->used = jiffies;
+					memcpy(temp_flow_dup->vmac, mac , ETH_ALEN);
+					spin_unlock_bh(&temp_flow_dup->lock);
+					
+					if(compare_fdose_flow(temp_flow_dup,temp_flow)){
+						dose_endpoint_update_delete(temp_flow);
+						ovs_fdose_tbl_remove(fdose_table_,temp_flow);
+						ovs_fdose_flow_free(temp_flow);
+						dose_endpoint_update_add(temp_flow_dup);
+						ovs_fdose_tbl_insert(fdose_table_,temp_flow_dup,&fdose_arp_key);
+					}
+					else {
+						temp_flow->used = jiffies;
+						dose_endpoint_update_add(temp_flow_dup);
+						ovs_fdose_flow_free(temp_flow_dup);
+						temp_flow_dup = 0;
+					}
+				}
+			}
+			/* if is is not an ARP pkg, change the TUNNEL info, such as dst_mac, dvnid, dst_pip */
+			else {
+				if(!memcmp(ovs_fdose_gateway_mac, eth->h_dest, ETH_ALEN)) {
+					FDOSE_DEBUG("gateway_packet\n");
+
+				}
+					FDOSE_DEBUG("fdose_ip_key.vip:%x\n",fdose_ip_key.vip);
+		                        FDOSE_DEBUG("fdose_ip_key.svnid:%x\n",fdose_ip_key.svnid);
+
+					temp_flow = ovs_fdose_tbl_lookup(fdose_table_,&fdose_ip_key);
+					if(temp_flow) {
+						spin_lock_bh(&temp_flow->lock);
+	                                       FDOSE_DEBUG("OVS_KEY_ATTR_REVISE1 :%x, %x, %x\n",temp_flow->pip,temp_flow->dvnid,temp_flow->vmac[5]);
+						if(!memcmp(ovs_fdose_gateway_mac, eth->h_dest, ETH_ALEN)) {
+							memcpy(eth->h_dest, temp_flow->vmac, ETH_ALEN);
+						}
+						OVS_CB(skb)->tun_key->ipv4_dst = temp_flow->pip;
+						OVS_CB(skb)->tun_key->tun_id = cpu_to_be64(ntohl(temp_flow->dvnid));
+						spin_unlock_bh(&temp_flow->lock);
+					} else {
+						dose_msg_t dose_loc_req;
+						dose_loc_req.hdr.type = DOSE_ENDPOINT_LOC_REQ;
+						dose_loc_req.data.vnid_src = ntohl(fdose_ip_key.svnid);
+						dose_loc_req.data.dst_ip = ntohl(fdose_ip_key.vip);
+						FDOSE_DEBUG("Lookup unknown IP addr for PARSd 11111111111111 \n");
+						send_zebra_message((void*)&dose_loc_req,sizeof(dose_loc_req),zebra_pid);
+						FDOSE_DEBUG("Lookup unknown IP addr for PARSd 222222222222222\n");
+					}
+			}
+			FDOSE_DEBUG("Register ARP in Fdose table 222222222222222222222222\n");
 }
